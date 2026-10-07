@@ -1,10 +1,10 @@
 package com.collab.platform.controller;
 
-import com.collab.platform.dto.CollabAction;
-import com.collab.platform.dto.CollabMessage;
-import com.collab.platform.dto.CreateItemRequest;
+import com.collab.platform.dto.*;
 import com.collab.platform.model.BoardItem;
+import com.collab.platform.model.ItemStatus;
 import com.collab.platform.service.BoardService;
+import com.collab.platform.service.ConflictService;
 import com.collab.platform.service.PresenceService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -58,6 +58,77 @@ public class BoardWebSocketController {
         log.info("Item created [{}] in room [{}] by {}", created.getId(), roomId, created.getLastModifiedBy());
         messagingTemplate.convertAndSend("/topic/rooms/" + roomId,
                 CollabMessage.of(CollabAction.ITEM_CREATED, roomId, created.getLastModifiedBy(), created));
+    }
+
+    /**
+     * Edit Item with Last-Write-Wins (LWW) conflict handling
+     */
+    @MessageMapping("/room/{roomId}/edit")
+    public void editItem(@DestinationVariable String roomId,
+                         @Payload EditItemRequest request) {
+        request.setRoomId(roomId);
+        ConflictService.ResolutionResult result = boardService.editItem(request);
+
+        if (result.type() == ConflictService.ResolutionType.CLEAN_UPDATE) {
+            log.info("Clean update for item [{}] in room [{}], new v{}",
+                    result.finalItem().getId(), roomId, result.finalItem().getVersion());
+            messagingTemplate.convertAndSend("/topic/rooms/" + roomId,
+                    CollabMessage.of(CollabAction.ITEM_UPDATED, roomId, request.getSender(), result.finalItem()));
+
+        } else if (result.type() == ConflictService.ResolutionType.LWW_OVERWRITE) {
+            log.warn("LWW Overwrite applied for item [{}] in room [{}]. Winner: {}",
+                    result.finalItem().getId(), roomId, result.conflictReport().getWinningUser());
+
+            // 1. Broadcast the updated item
+            messagingTemplate.convertAndSend("/topic/rooms/" + roomId,
+                    CollabMessage.of(CollabAction.ITEM_UPDATED, roomId, request.getSender(), result.finalItem()));
+
+            // 2. Broadcast the conflict report explaining why and who won
+            messagingTemplate.convertAndSend("/topic/rooms/" + roomId,
+                    CollabMessage.of(CollabAction.CONFLICT_DETECTED, roomId, "System", result.conflictReport()));
+
+        } else {
+            // LWW_REJECTED
+            log.warn("LWW Rejection for item [{}] in room [{}]. Rejected: {}, Winner: {}",
+                    result.finalItem().getId(), roomId, result.conflictReport().getRejectedUser(), result.conflictReport().getWinningUser());
+
+            // Broadcast conflict notification with latest winning state
+            messagingTemplate.convertAndSend("/topic/rooms/" + roomId,
+                    CollabMessage.of(CollabAction.CONFLICT_DETECTED, roomId, "System", result.conflictReport()));
+        }
+    }
+
+    /**
+     * Quick status transition (TODO <-> IN_PROGRESS <-> DONE)
+     */
+    @MessageMapping("/room/{roomId}/status")
+    public void updateStatus(@DestinationVariable String roomId,
+                             @Payload Map<String, String> payload) {
+        String itemId = payload.get("itemId");
+        String statusStr = payload.get("status");
+        String sender = payload.getOrDefault("sender", "Anonymous");
+
+        ItemStatus status = ItemStatus.valueOf(statusStr);
+        BoardItem updated = boardService.updateItemStatus(roomId, itemId, status, sender);
+
+        messagingTemplate.convertAndSend("/topic/rooms/" + roomId,
+                CollabMessage.of(CollabAction.ITEM_STATUS_CHANGED, roomId, sender, updated));
+    }
+
+    /**
+     * Delete Item in Room
+     */
+    @MessageMapping("/room/{roomId}/delete")
+    public void deleteItem(@DestinationVariable String roomId,
+                           @Payload Map<String, String> payload) {
+        String itemId = payload.get("itemId");
+        String sender = payload.getOrDefault("sender", "Anonymous");
+
+        boolean deleted = boardService.deleteItem(roomId, itemId);
+        if (deleted) {
+            messagingTemplate.convertAndSend("/topic/rooms/" + roomId,
+                    CollabMessage.of(CollabAction.ITEM_DELETED, roomId, sender, Map.of("itemId", itemId)));
+        }
     }
 
     /**
