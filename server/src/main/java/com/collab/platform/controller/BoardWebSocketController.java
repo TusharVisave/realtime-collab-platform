@@ -13,6 +13,7 @@ import org.springframework.messaging.handler.annotation.MessageMapping;
 import org.springframework.messaging.handler.annotation.Payload;
 import org.springframework.messaging.simp.SimpMessageHeaderAccessor;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.messaging.simp.annotation.SubscribeMapping;
 import org.springframework.stereotype.Controller;
 
 import java.util.Map;
@@ -42,6 +43,11 @@ public class BoardWebSocketController {
         // Broadcast presence update strictly to room topic
         messagingTemplate.convertAndSend("/topic/rooms/" + roomId,
                 CollabMessage.of(CollabAction.PRESENCE_SYNC, roomId, username, presenceService.getUsersInRoom(roomId)));
+
+        // Send full sync snapshot directly to room or requester
+        RoomSyncPayload sync = boardService.getRoomSyncSnapshot(roomId);
+        messagingTemplate.convertAndSend("/topic/rooms/" + roomId,
+                CollabMessage.of(CollabAction.ROOM_SYNC, roomId, "System", sync));
 
         log.info("User {} joined room {}", username, roomId);
     }
@@ -139,7 +145,7 @@ public class BoardWebSocketController {
                              @Payload Map<String, String> payload,
                              SimpMessageHeaderAccessor headerAccessor) {
         String sessionId = headerAccessor.getSessionId();
-        String itemId = payload.get("itemId");
+        String itemId = payload.get("itemId"); // may be null/empty if stopped editing
         String username = payload.getOrDefault("username", "Anonymous");
 
         presenceService.updateEditingItem(sessionId, itemId);
@@ -147,5 +153,15 @@ public class BoardWebSocketController {
         messagingTemplate.convertAndSend("/topic/rooms/" + roomId,
                 CollabMessage.of(CollabAction.PRESENCE_TYPING, roomId, username,
                         Map.of("username", username, "itemId", (itemId != null ? itemId : ""))));
+    }
+
+    /**
+     * Explicit Reconnect Catch-up Sync
+     */
+    @MessageMapping("/room/{roomId}/sync")
+    public void requestSync(@DestinationVariable String roomId) {
+        RoomSyncPayload sync = boardService.getRoomSyncSnapshot(roomId);
+        messagingTemplate.convertAndSend("/topic/rooms/" + roomId,
+                CollabMessage.of(CollabAction.ROOM_SYNC, roomId, "System", sync));
     }
 }
